@@ -3,6 +3,9 @@
 #include <vector>
 #include <string>
 #include <random>
+cd queens-blood
+git init
+git remote add origin https://github.com/YOUR-USERNAME/queens-blood-game.git
 
 // -------------------- Card Struct --------------------
 struct Card {
