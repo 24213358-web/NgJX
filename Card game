@@ -1,0 +1,338 @@
+// QueenBlood_SFML.cpp
+// Compile:
+// g++ -std=c++17 QueenBlood_SFML.cpp -O2 -lsfml-graphics -lsfml-window -lsfml-system -o QueenBloodSFML
+
+#include <SFML/Graphics.hpp>
+#include <bits/stdc++.h>
+using namespace std;
+
+// ----- Game data structures (adapted from your code) -----
+struct Card {
+    string id;
+    string suit;
+    string rank;
+    bool isQueen;
+};
+
+struct Deck {
+    vector<Card> cards;
+    mt19937 rng;
+    Deck() { rng = mt19937((unsigned)chrono::high_resolution_clock::now().time_since_epoch().count()); }
+    void build_standard_themed() {
+        cards.clear();
+        vector<string> suits = {"Mako", "Shinra", "Avalanche", "Wutai"};
+        vector<string> ranks = {"A","2","3","4","5","6","7","8","9","10","J","Q","K"};
+        for (auto &s : suits) {
+            for (auto &r : ranks) {
+                Card c; c.suit = s; c.rank = r;
+                c.id = r + "-" + s.substr(0,3);
+                c.isQueen = (r == "Q");
+                cards.push_back(c);
+            }
+        }
+    }
+    void shuffle_deck() { std::shuffle(cards.begin(), cards.end(), rng); }
+    bool empty() const { return cards.empty(); }
+    Card draw() {
+        if (cards.empty()) throw runtime_error("Deck is empty");
+        Card c = cards.back(); cards.pop_back(); return c;
+    }
+    int size() const { return (int)cards.size(); }
+};
+
+struct Player {
+    string name;
+    vector<Card> hand;
+    bool isAI = false;
+    Player() = default;
+    Player(string n, bool ai=false): name(n), isAI(ai) {}
+    void receive(const Card &c) { hand.push_back(c); }
+    bool hasCards() const { return !hand.empty(); }
+    Card playAtIndex(size_t idx) {
+        if (idx >= hand.size()) throw runtime_error("invalid index");
+        Card c = hand[idx];
+        hand.erase(hand.begin()+idx);
+        return c;
+    }
+    Card playRandom(mt19937 &rng) {
+        if (hand.empty()) throw runtime_error("playRandom called on empty hand");
+        uniform_int_distribution<int> dist(0, (int)hand.size()-1);
+        int idx = dist(rng);
+        return playAtIndex(idx);
+    }
+};
+
+struct Board {
+    vector<pair<Card,string>> table;
+    vector<Card> discard;
+    void place(const Card &c, const string &by) { table.push_back({c,by}); }
+    void discardCard(const Card &c) { discard.push_back(c); }
+};
+
+// ----- Utility -----
+string cardLabel(const Card &c) {
+    return c.rank + "\n" + c.suit.substr(0, min<size_t>(c.suit.size(),6));
+}
+
+// choose random opponent index (not equal to 'self'), or -1 if none
+int pickRandomOpponent(int self, const vector<Player> &players, mt19937 &rng) {
+    vector<int> others;
+    for (int i=0;i<(int)players.size();++i) if (i!=self) others.push_back(i);
+    if (others.empty()) return -1;
+    uniform_int_distribution<int> dist(0, (int)others.size()-1);
+    return others[dist(rng)];
+}
+
+// Queen effect: target discards random card
+void queenEffect(Player &target, Board &board, mt19937 &rng) {
+    if (!target.hasCards()) return;
+    Card discarded = target.playRandom(rng);
+    board.discardCard(discarded);
+}
+
+// ----- GUI constants -----
+const int WINDOW_W = 1100;
+const int WINDOW_H = 700;
+const sf::Vector2f DECK_POS(50, 50);
+const sf::Vector2f DISCARD_POS(150, 50);
+const sf::Vector2f TABLE_CENTER(WINDOW_W/2.f, WINDOW_H/2.f - 50);
+const sf::Vector2f HAND_ORIGIN(100, WINDOW_H - 180);
+const sf::Vector2f CARD_SIZE(90,130);
+
+// ----- Main program -----
+int main() {
+    // Set up game state (2-4 players). For simplicity we create 2 players: human + CPU.
+    int numPlayers = 2;
+    vector<Player> players;
+    players.emplace_back("You", false);
+    players.emplace_back("CPU1", true);
+    // If you want more players, push more CPUs here.
+
+    Deck deck;
+    deck.build_standard_themed();
+    deck.shuffle_deck();
+    Board board;
+    mt19937 rng((unsigned)chrono::high_resolution_clock::now().time_since_epoch().count());
+
+    // initial deal
+    int dealCount = 5;
+    for (int r=0;r<dealCount;++r) for (auto &p : players) if (!deck.empty()) p.receive(deck.draw());
+
+    int current = 0;
+
+    // SFML window + font
+    sf::RenderWindow window(sf::VideoMode(WINDOW_W, WINDOW_H), "Queen's Blood — FF7 (SFML)");
+    sf::Font font;
+    if (!font.loadFromFile("arial.ttf")) {
+        // Try to continue with default if font missing (but text size may vary)
+        // You should place a TTF named arial.ttf next to the executable.
+        cerr << "Warning: failed to load arial.ttf. Place a font file named arial.ttf in working dir.\n";
+    }
+
+    // Pre-create rectangle shapes
+    sf::RectangleShape deckRect(CARD_SIZE), discardRect(CARD_SIZE);
+    deckRect.setPosition(DECK_POS); deckRect.setFillColor(sf::Color(200,200,200));
+    deckRect.setOutlineColor(sf::Color::Black); deckRect.setOutlineThickness(2.f);
+    discardRect.setPosition(DISCARD_POS); discardRect.setFillColor(sf::Color(230,230,230));
+    discardRect.setOutlineColor(sf::Color::Black); discardRect.setOutlineThickness(2.f);
+
+    // Game loop
+    sf::Clock clock;
+    bool running = true;
+    while (window.isOpen() && running) {
+        // process events
+        sf::Event event;
+        while (window.pollEvent(event)) {
+            if (event.type == sf::Event::Closed) window.close();
+            if (event.type == sf::Event::MouseButtonPressed && event.mouseButton.button == sf::Mouse::Left) {
+                sf::Vector2f mpos((float)event.mouseButton.x, (float)event.mouseButton.y);
+
+                // If it's current player's turn and they are human, allow interaction
+                Player &p = players[current];
+                if (!p.isAI) {
+                    // Click Deck to draw
+                    if (deckRect.getGlobalBounds().contains(mpos)) {
+                        if (!deck.empty()) {
+                            Card c = deck.draw();
+                            p.receive(c);
+                        } else if (!board.discard.empty()) {
+                            // reshuffle discard into deck, preserve last top as new discard
+                            Card top = board.discard.back(); board.discard.pop_back();
+                            for (auto &c : board.discard) deck.cards.push_back(c);
+                            board.discard.clear();
+                            deck.cards.push_back(top); // keep one on discard
+                            deck.shuffle_deck();
+                        }
+                    }
+
+                    // Click a card in player's hand to play it
+                    // Compute hand card rectangles
+                    float spacing = 20.f;
+                    float startx = HAND_ORIGIN.x;
+                    for (size_t i=0;i<p.hand.size();++i) {
+                        sf::Vector2f pos(startx + i * (CARD_SIZE.x + spacing), HAND_ORIGIN.y);
+                        sf::FloatRect rect(pos, CARD_SIZE);
+                        if (rect.contains(mpos)) {
+                            // play this card
+                            Card c = p.playAtIndex(i);
+                            board.place(c, p.name);
+                            if (c.isQueen) {
+                                int targetIdx = pickRandomOpponent(current, players, rng);
+                                if (targetIdx != -1) queenEffect(players[targetIdx], board, rng);
+                            }
+                            // after play, end human turn
+                            current = (current + 1) % players.size();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // If it's an AI player's turn, run AI actions (simple)
+        Player &pcurr = players[current];
+        if (pcurr.isAI) {
+            // AI: short delay to make actions visible
+            sf::sleep(sf::milliseconds(300));
+            bool acted = false;
+            // if AI has queen, 50% chance to play it
+            for (size_t i=0;i<pcurr.hand.size();++i) {
+                if (pcurr.hand[i].isQueen) {
+                    uniform_int_distribution<int> coin(0,1);
+                    if (coin(rng) == 1) {
+                        Card c = pcurr.playAtIndex(i);
+                        board.place(c, pcurr.name);
+                        int targetIdx = pickRandomOpponent(current, players, rng);
+                        if (targetIdx != -1) queenEffect(players[targetIdx], board, rng);
+                        acted = true;
+                        break;
+                    }
+                }
+            }
+            if (!acted) {
+                if (pcurr.hasCards()) {
+                    Card c = pcurr.playRandom(rng);
+                    board.place(c, pcurr.name);
+                    if (c.isQueen) {
+                        int targetIdx = pickRandomOpponent(current, players, rng);
+                        if (targetIdx != -1) queenEffect(players[targetIdx], board, rng);
+                    }
+                } else {
+                    // draw if deck available
+                    if (!deck.empty()) { Card c = deck.draw(); pcurr.receive(c); }
+                }
+            }
+            // AI turn ends
+            current = (current + 1) % players.size();
+        }
+
+        // Housekeeping: reshuffle discard into deck if deck empty
+        if (deck.empty() && !board.discard.empty()) {
+            // keep top discard if desired; here we reshuffle all discard back
+            for (auto &c : board.discard) deck.cards.push_back(c);
+            board.discard.clear();
+            deck.shuffle_deck();
+        }
+
+        // Rendering
+        window.clear(sf::Color(20,120,40)); // felt green
+
+        // Draw deck rectangle and count
+        window.draw(deckRect);
+        sf::Text deckText(to_string(deck.size()), font, 18);
+        deckText.setFillColor(sf::Color::Black);
+        deckText.setPosition(DECK_POS.x + 10, DECK_POS.y + CARD_SIZE.y + 6);
+        window.draw(deckText);
+        sf::Text deckLabel("Deck", font, 14); deckLabel.setPosition(DECK_POS.x, DECK_POS.y - 18);
+        window.draw(deckLabel);
+
+        // Draw discard top card (if any)
+        window.draw(discardRect);
+        sf::Text discLabel("Discard", font, 14); discLabel.setPosition(DISCARD_POS.x, DISCARD_POS.y - 18);
+        window.draw(discLabel);
+        if (!board.discard.empty()) {
+            const Card &top = board.discard.back();
+            sf::RectangleShape topRect(CARD_SIZE);
+            topRect.setPosition(DISCARD_POS);
+            topRect.setFillColor(sf::Color::White);
+            topRect.setOutlineColor(sf::Color::Black); topRect.setOutlineThickness(2.f);
+            window.draw(topRect);
+            sf::Text t(cardLabel(top), font, 14);
+            t.setFillColor(sf::Color::Black);
+            t.setPosition(DISCARD_POS.x + 6, DISCARD_POS.y + 12);
+            window.draw(t);
+        }
+
+        // Draw table cards (spread across center)
+        float tableSpacing = 30.f;
+        float totalWidth = (int)board.table.size() * (CARD_SIZE.x + tableSpacing);
+        float startX = TABLE_CENTER.x - totalWidth/2.f + (CARD_SIZE.x/2.f);
+        for (size_t i=0;i<board.table.size();++i) {
+            sf::Vector2f pos(startX + i * (CARD_SIZE.x + tableSpacing), TABLE_CENTER.y - CARD_SIZE.y/2.f);
+            sf::RectangleShape r(CARD_SIZE);
+            r.setPosition(pos);
+            r.setFillColor(sf::Color::White);
+            r.setOutlineColor(sf::Color::Black); r.setOutlineThickness(2.f);
+            window.draw(r);
+            sf::Text t(cardLabel(board.table[i].first), font, 14);
+            t.setFillColor(board.table[i].first.isQueen ? sf::Color::Red : sf::Color::Black);
+            t.setPosition(pos.x + 6, pos.y + 8);
+            window.draw(t);
+
+            // played by label
+            sf::Text by(board.table[i].second, font, 12);
+            by.setFillColor(sf::Color(50,50,50)); by.setPosition(pos.x+6, pos.y + CARD_SIZE.y - 20);
+            window.draw(by);
+        }
+
+        // Draw current player's hand (bottom). Only show the current player's hand for simplicity.
+        Player &pcur = players[current];
+        // Show a label who is current
+        sf::Text curLabel((pcur.isAI ? string("AI: ") : string("You: ")) + pcur.name, font, 18);
+        curLabel.setFillColor(sf::Color::White);
+        curLabel.setPosition(HAND_ORIGIN.x, HAND_ORIGIN.y - 36);
+        window.draw(curLabel);
+
+        float spacing = 20.f;
+        float startx = HAND_ORIGIN.x;
+        for (size_t i=0;i<pcur.hand.size();++i) {
+            sf::Vector2f pos(startx + i * (CARD_SIZE.x + spacing), HAND_ORIGIN.y);
+            sf::RectangleShape r(CARD_SIZE);
+            r.setPosition(pos);
+            r.setFillColor(sf::Color::White);
+            r.setOutlineColor(sf::Color::Black); r.setOutlineThickness(2.f);
+            if (pcur.hand[i].isQueen) r.setOutlineColor(sf::Color::Red);
+            window.draw(r);
+
+            sf::Text t(cardLabel(pcur.hand[i]), font, 14);
+            t.setFillColor(sf::Color::Black);
+            t.setPosition(pos.x + 6, pos.y + 8);
+            window.draw(t);
+        }
+
+        // Draw small help text
+        sf::Text hint("Click deck to draw. Click your bottom cards to play. Queen auto-targets random opponent.", font, 14);
+        hint.setFillColor(sf::Color::White);
+        hint.setPosition(10, WINDOW_H - 28);
+        window.draw(hint);
+
+        window.display();
+
+        // Simple end condition: if deck empty and any player's hand empty -> stop and show a console summary
+        bool someoneHasNoCards = false;
+        for (auto &pl : players) if (!pl.hasCards() && deck.empty()) someoneHasNoCards = true;
+        if (someoneHasNoCards) {
+            cout << "Game end: deck empty and at least one player has no cards.\n";
+            // print final hands to console
+            for (auto &pl : players) {
+                cout << pl.name << " hand: ";
+                for (auto &c : pl.hand) cout << c.rank << "-" << c.suit.substr(0,3) << " ";
+                cout << "\n";
+            }
+            sf::sleep(sf::milliseconds(1500));
+            running = false;
+        }
+    }
+
+    return 0;
+}
